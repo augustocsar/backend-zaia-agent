@@ -1,15 +1,16 @@
 # main.py
 import os
+import shutil
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, UploadFile, File
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.middleware.cors import CORSMiddleware  # <--- ADICIONADO
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import AsyncGenerator
 
-# LangChain + LangGraph
+# --- Importações do LangChain ---
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
 from langgraph.prebuilt import create_react_agent
@@ -17,157 +18,137 @@ from langchain.tools import tool
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
+# --- RAG LOCAL (Sem API, Sem Cota) ---
+from langchain_huggingface import HuggingFaceEmbeddings
+# -------------------------------------
+
+# --- Configuração ---
 load_dotenv()
 
 HG_API_KEY = os.getenv("HG_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 if not HG_API_KEY or not GOOGLE_API_KEY:
-    raise EnvironmentError("Chaves de API não encontradas no .env")
+    raise EnvironmentError("Faltam chaves! Verifique HG_API_KEY e GOOGLE_API_KEY no .env")
 
-# ---------- FastAPI com CORS ----------
-app = FastAPI(
-    title="Zaia Agent",
-    description="Agente com clima, dólar, PDF e streaming",
-    version="1.0.0"
-)
+# --- App ---
+app = FastAPI(title="Zaia Agent", version="1.0.0")
 
-# LIBERA CORS PARA O FRONTEND (Vite)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- Autenticação Mock ----------
+# --- Auth ---
 security = HTTPBasic()
-
 def verify(creds: HTTPBasicCredentials = Depends(security)):
     if creds.username != "admin" or creds.password != "1234":
         raise HTTPException(401, "Credenciais inválidas")
     return creds.username
 
-# ---------- Ferramentas ----------
+# --- Ferramentas ---
 @tool
 def get_clima(cidade: str) -> str:
-    """Obtém o clima de uma cidade."""
-    url = f"https://api.hgbrasil.com/weather?key={HG_API_KEY}&city_name={cidade}"
+    """Obtém clima."""
     try:
-        r = requests.get(url, timeout=10).json()["results"]
-        return f"Clima em {r['city']}: {r['temp']}°C, {r['description'].lower()}."
-    except:
-        return "Erro: cidade não encontrada."
+        url = f"https://api.hgbrasil.com/weather?key={HG_API_KEY}&city_name={cidade}"
+        r = requests.get(url).json()["results"]
+        return f"Clima em {r['city']}: {r['temp']}C, {r['description']}."
+    except: return "Erro ao buscar clima."
 
 @tool
 def get_cotacao(moeda: str = "dólar") -> str:
-    """Obtém a cotação de qualquer moeda disponível na HG Brasil.
-    Exemplos: dólar, euro, bitcoin, libra, iene, etc."""
-    moeda = moeda.lower().strip()
-    
-    # Mapeamento de nomes comuns → código da API
-    mapeamento = {
-        "dolar": "USD", "dólar": "USD", "usd": "USD",
-        "euro": "EUR", "€": "EUR",
-        "bitcoin": "BTC", "btc": "BTC",
-        "libra": "GBP", "libra esterlina": "GBP",
-        "iene": "JPY", "iêne": "JPY", "yen": "JPY",
-        "dolar australiano": "AUD", "aud": "AUD",
-        "dolar canadense": "CAD", "cad": "CAD",
-        "franco suíço": "CHF", "chf": "CHF",
-    }
-    
-    codigo = mapeamento.get(moeda)
-    if not codigo:
-        # Tenta buscar diretamente pelo código (ex: usuário digita "EUR")
-        if moeda.upper() in ["USD", "EUR", "BTC", "GBP", "JPY", "AUD", "CAD", "CHF"]:
-            codigo = moeda.upper()
-        else:
-            return f"Desculpe, não tenho cotação para '{moeda}'. Tente: dólar, euro, bitcoin, libra, iene..."
-    
-    url = f"https://api.hgbrasil.com/finance?key={HG_API_KEY}"
+    """Obtém cotação."""
     try:
-        data = requests.get(url, timeout=10).json()["results"]["currencies"]
-        moeda_info = data.get(codigo)
-        if not moeda_info or "buy" not in moeda_info:
-            return f"Não consegui obter a cotação do {moeda} no momento."
+        url = f"https://api.hgbrasil.com/finance?key={HG_API_KEY}"
+        d = requests.get(url).json()["results"]["currencies"]
+        code = "USD" if "dolar" in moeda.lower() else "EUR" if "euro" in moeda.lower() else "BTC"
+        if code in d: return f"{d[code]['name']}: R$ {d[code]['buy']}"
+    except: pass
+    return "Cotação não encontrada."
+
+# --- RAG LOCAL ---
+vectorstore = None
+
+def processar_pdf_interno(caminho: str) -> str:
+    global vectorstore
+    if not os.path.exists(caminho): return "Arquivo não existe."
+    
+    try:
+        # Carrega
+        print("Carregando PDF...")
+        loader = PyPDFLoader(caminho)
+        docs = loader.load()
         
-        nome = moeda_info.get("name", codigo)
-        valor = moeda_info["buy"]
-        variacao = moeda_info.get("variation", 0)
+        # Divide
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        chunks = splitter.split_documents(docs)
         
-        return f"A cotação do {nome} é R$ {valor:.4f} (variação: {variacao}%)"
+        # Indexa LOCALMENTE (Hugging Face na CPU)
+        print("Criando Embeddings Locais...")
+        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        
+        # Salva
+        vectorstore = FAISS.from_documents(chunks, embeddings)
+        return "PDF processado com sucesso (Local)!"
         
     except Exception as e:
-        return "Erro ao consultar cotação. Tente novamente."
-# RAG para PDF
-vectorstore = None
+        print(f"ERRO RAG: {e}")
+        return f"Erro interno: {str(e)}"
 
 @tool
 def carregar_pdf(caminho: str) -> str:
-    """Carrega um PDF para busca."""
-    global vectorstore
-    if not os.path.exists(caminho):
-        return "PDF não encontrado."
-    loader = PyPDFLoader(caminho)
-    docs = loader.load()
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    chunks = splitter.split_documents(docs)
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GOOGLE_API_KEY)
-    vectorstore = FAISS.from_documents(chunks, embeddings)
-    return "PDF carregado com sucesso."
+    """Carrega PDF."""
+    return processar_pdf_interno(caminho)
 
 @tool
 def buscar_no_pdf(pergunta: str) -> str:
-    """Busca no PDF carregado."""
-    if vectorstore is None:
-        return "Nenhum PDF carregado."
-    docs = vectorstore.similarity_search(pergunta, k=3)
-    return "\n\n".join([d.page_content[:500] for d in docs])
+    """
+    Use esta ferramenta para responder QUALQUER pergunta sobre o conteúdo do documento ou PDF anexado.
+    O PDF JÁ ESTÁ CARREGADO na memória.
+    Não peça para o usuário carregar o arquivo.
+    Apenas pesquise a resposta aqui.
+    """
+    global vectorstore
+    if not vectorstore: return "Nenhum PDF carregado."
+    try:
+        docs = vectorstore.similarity_search(pergunta, k=3)
+        return "\n".join([d.page_content[:500] for d in docs])
+    except: return "Erro na busca."
 
-tools = [get_clima, get_cotacao, carregar_pdf, buscar_no_pdf]
+tools = [get_clima, get_cotacao, buscar_no_pdf]
 
-# ---------- LLM ----------
+# --- AGENTE (Aqui está o Gemini 2.0 Flash) ---
 llm = ChatGoogleGenerativeAI(
-    model="gemini-2.0-flash",  # ← CORRIGIDO
+    model="gemini-2.0-flash", # <--- AGORA SIM!
     google_api_key=GOOGLE_API_KEY,
     temperature=0,
-    streaming=True,
+    streaming=True
 )
-
-# ---------- Agente com LangGraph ----------
 agent = create_react_agent(llm, tools)
 
-# ---------- Modelos ----------
-class Pergunta(BaseModel):
-    question: str
+class Pergunta(BaseModel): question: str
 
 async def stream_agent(question: str) -> AsyncGenerator[str, None]:
-    async for chunk in agent.astream_events(
-        {"messages": [HumanMessage(content=question)]},
-        version="v1"
-    ):
+    async for chunk in agent.astream_events({"messages": [HumanMessage(content=question)]}, version="v1"):
         if chunk["event"] == "on_chat_model_stream":
-            content = chunk["data"]["chunk"].content
-            # REMOVE TODOS OS "1" E ESPAÇOS
-            clean_content = content.replace("1", "").strip()
-            if clean_content:
-                yield clean_content
-
-# ---------- Endpoints ----------
-@app.get("/")
-async def root():
-    return {"message": "Zaia Agent - Login: admin/1234"}
+            if chunk["data"]["chunk"].content: yield chunk["data"]["chunk"].content
 
 @app.post("/chat")
 async def chat(p: Pergunta, user: str = Depends(verify)):
     return StreamingResponse(stream_agent(p.question), media_type="text/plain")
 
 @app.post("/upload-pdf")
-async def upload_pdf(req: Request, user: str = Depends(verify)):
-    data = await req.json()
-    caminho = data.get("path", "docs/documento.pdf")
-    return {"status": carregar_pdf(caminho)}
+async def upload_pdf(file: UploadFile = File(...), user: str = Depends(verify)):
+    try:
+        os.makedirs("uploads", exist_ok=True)
+        loc = f"uploads/{file.filename}"
+        with open(loc, "wb+") as buffer: shutil.copyfileobj(file.file, buffer)
+        return {"status": processar_pdf_interno(loc)}
+    except Exception as e: return {"status": str(e)}
+
+# uvicorn main:app --reload
