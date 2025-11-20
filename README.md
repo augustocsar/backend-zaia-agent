@@ -36,7 +36,7 @@ backend-zaia-agent/
 
 1.  **Clone o repositório:**
     ```bash
-    git clone [https://github.com/augustocsar/backend-zaia-agent.git](https://github.com/augustocsar/backend-zaia-agent.git)
+    git clone https://github.com/augustocsar/backend-zaia-agent.git
     cd backend-zaia-agent
     ```
 
