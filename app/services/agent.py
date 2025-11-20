@@ -5,7 +5,7 @@ from app.services.tools_api import get_clima, get_cotacao
 from app.services.rag_service import buscar_no_pdf
 
 # Lista de ferramentas que o agente pode usar
-# (Removemos 'carregar_pdf' pois o upload é via botão, não via chat)
+# A ferramenta de carga (carregar_pdf) é acionada via endpoint dedicado, não pelo agente.
 tools = [get_clima, get_cotacao, buscar_no_pdf]
 
 # Inicializa o LLM
